@@ -23,11 +23,9 @@
 
 ---
 
-## 1. 相談内容
+## 1. 課題
 
-Azure SQL Database または Managed Instance ではメンテナンス時に瞬断が発生する前提で、DB サーバの呼び出し側（App Service 側）で DB サーバ瞬断時にリトライを行う仕組みの導入を検討している。
-しかし、DB サーバのコミット後〜App Service への応答というわずかなタイミングで瞬断した場合、**「DB がコミットされているにもかかわらず、AP サーバに応答が来ない」**という現象が発生することを懸念している。
-本事象（DB コミットはしているが応答時に瞬断したかどうか）を Azure Monitor などで検知、または AP サーバ側で検知するなど手段があるか。また、本事象の発生頻度はどの程度発生するか。
+Azure SQL Database または Managed Instance ではメンテナンス時に瞬断が発生する前提で、DB サーバの呼び出し側（App Service 側）で DB サーバ瞬断時にリトライを行う仕組みの導入を検討している。しかし、DB サーバのコミット後〜App Service への応答というわずかなタイミングで瞬断した場合、**「DB がコミットされているにもかかわらず、AP サーバに応答が来ない」**　という現象が発生することを懸念している。
 
 ---
 
@@ -137,7 +135,7 @@ $$
 | **Resource Health**（[SQL Database の判定仕様](https://learn.microsoft.com/azure/azure-sql/database/resource-health-to-troubleshoot-connectivity?view=azuresql)） | Degraded / Unavailable と最大 30 日の履歴。判定できたダウンタイム理由（Planned maintenance / Reconfiguration）は通常約 45 分以内に公開。Resource Health アラート可 | SQL DB の状態更新は 1〜2 分間隔、ダウンタイム履歴は 2 分粒度。**ログイン失敗数などのしきい値未満の瞬断は検知されないことがある**。アラート時刻も数分遅れる。MI には製品別の判定仕様がある |
 | **Azure Monitor メトリック** `connection_failed`（システム エラー） | 1 分粒度で接続失敗数 | SQL DB 向け（MI のメトリック名は未確認） |
 | **診断ログ「Errors」カテゴリ** → Log Analytics（[診断テレメトリ](https://learn.microsoft.com/azure/azure-sql/database/metrics-diagnostic-telemetry-logging-streaming-export-configure?view=azuresql)） | 記録された SQL エラーを `error_number_d` などで調査できる | **SQL DB / MI のユーザー DB に対応**。DB ごとに診断設定の有効化が必要。すべてのクライアント側切断やタイムアウトの記録を保証しない |
-| **`sys.event_log`**（master） | 接続成功 / 失敗の 5 分集計、30 日保持 | **SQL DB のみ**。再構成というイベント種別は無く、負荷も高いため補助的 |
+| **`sys.event_log`**（master） | 接続成功 / 失敗の 5 分集計。保持は**最大** 30 日（DB 数と一意イベント数によってはそれ未満） | **SQL DB のみ**。再構成というイベント種別は無い。**データ反映は通常 1 時間以内、最大 24 時間**かかるため直後の時刻突合には使えない。master への負荷も高く補助的 |
 
 **限界:** これらのテレメトリだけでは、個々のトランザクションの成功応答喪失やコミット成否は判定できない。AP 側ログの**裏取り（時刻の突合）**に使う位置づけであり、**記録がないことは「瞬断がなかった」証明にならない**。
 
@@ -159,14 +157,14 @@ $$
 
 | パターン | 内容 | 適用 |
 |---|---|---|
-| **トランザクション追跡（ジャーナル）テーブル** | 業務更新と同じトランザクションの先頭で一意 ID の行を INSERT。Commit 失敗時にコミット済みの行を読めれば、その要求の成功を確認できる。**行が見えないだけではロールバック済みと断定しない** | **汎用的**。EF6 `CommitFailureHandler`（`__Transactions` 表）/ EF Core Option 4 が同系統の考え方。独自実装では分離レベル・保持期間・キーの一意性を設計する |
+| **トランザクション追跡（ジャーナル）テーブル** | 業務更新と同じトランザクションの先頭で一意 ID の行を INSERT。Commit 失敗時にコミット済みの行を読めれば、その要求の成功を確認できる。**行が見えないだけではロールバック済みと断定しない** | **汎用的**。EF6 `CommitFailureHandler`（`__Transactions` 表）/ EF Core の「トランザクションを手動で追跡する」解法が同系統の考え方。独自実装では分離レベル・保持期間・キーの一意性を設計する |
 | **状態検証** | EF Core `ExecuteInTransaction(operation, verifySucceeded)` の `verifySucceeded`（「トランザクションのコミット中に例外がスローされた場合でも、操作が成功したかどうかを検査する」）で業務データを再読取り | 業務キーで成否が判定できる場合 |
 | **クライアント生成キー** | GUID 等を使い、二重実行は一意制約違反として「予測可能に失敗」させる（IDENTITY 依存を避ける） | INSERT 中心の処理 |
 | （参考）SQL 監査 BATCH_COMPLETED | サーバ側の実行証跡は残るが負荷が大きい | 事後調査用途に限定 |
 
 検証先は **更新と同じ DB の書き込み先プライマリ**とし、READ COMMITTED 以上の読み取りを使う。`NOLOCK` / READ UNCOMMITTED による未コミット行の読み取りや、読み取り専用レプリカの反映遅延を成功判定に使わない。
 
-Azure SQL Database の既定の **RCSI** はステートメント開始時点のコミット済みデータを読むため、元のコミットがまだ進行中ならジャーナル行が見えない場合がある（[分離レベルの仕様](https://learn.microsoft.com/sql/t-sql/statements/set-transaction-isolation-level-transact-sql?view=sql-server-ver17)）。7-3 の参考実装は、その場合も照会を繰り返し、確認できなければ `InDoubt` とする保守的な方式を採用する。**実際にはロールバック済みでも不確定として残る場合がある**。
+Azure SQL Database の既定の **RCSI** はステートメント開始時点のコミット済みデータを読むため、元のコミットがまだ進行中ならジャーナル行が見えない場合がある（[分離レベルの仕様](https://learn.microsoft.com/sql/t-sql/statements/set-transaction-isolation-level-transact-sql?view=sql-server-ver17)）。**RCSI 有効時は `WITH (READCOMMITTED)` ヒントを付けても行バージョン管理のまま**なので、この未観測は回避できない。元トランザクションの決着まで待って確定的な答え（コミット済み / ロールバック済み）を得たい場合は `WITH (READCOMMITTEDLOCK)` でロック待ちさせる選択肢もあるが、ブロッキングと待ち時間が発生する。7-3 の参考実装はヒントで挙動を変えず、照会を繰り返し、確認できなければ `InDoubt` とする保守的な方式を採用する。**実際にはロールバック済みでも不確定として残る場合がある**。
 
 「同じキーの INSERT を再試行して一意制約で二重適用を防ぐこと」と「元の試行のロールバックを証明すること」は別である。再送時はキーと要求内容を維持し、ジャーナルの INSERT に成功した場合だけ業務処理を実行する。
 
@@ -190,7 +188,7 @@ Azure SQL Database の既定の **RCSI** はステートメント開始時点の
 
 | 選択肢 | 位置づけ | 備考 |
 |---|---|---|
-| **Microsoft.Data.SqlClient**（NuGet） | **推奨** | .NET Framework 4.6.2 以降に対応。2026-09-16 確認時のサポート版は 7.0（STS）と 6.1（LTS、2028-08-14 まで）。**本例は 6.1 の最新修正パッチを前提**とする。7.0 で Managed Identity 等の Entra 認証を使う場合は `Microsoft.Data.SqlClient.Extensions.Azure` も必要 |
+| **Microsoft.Data.SqlClient**（NuGet） | **推奨** | .NET Framework 4.6.2 以降に対応。2026-09-16 確認時のサポート版は 7.0（STS）と 6.1（LTS、2028-08-14 まで）。**本例は 6.1 の最新修正パッチを前提**とする（3-3 の Commit タイムアウト挙動は `v6.1.0` タグの公開実装で確認したもので、パッチ間の差分は採用時に確認する）。7.0 で Managed Identity 等の Entra 認証を使う場合は `Microsoft.Data.SqlClient.Extensions.Azure` も必要 |
 | System.Data.SqlClient（Framework 同梱） | 既存資産がある場合 | `using` の変更に加え、`RetryLogicProvider` の設定と `OpenRetryProvider` の定義（`SqlRetryLogicBaseProvider` / `SqlConfigurableRetryFactory` / `SqlRetryLogicOption`）を除去・置換する。**2 行の削除だけでは移植できない**。接続文字列の Managed Identity 認証もそのまま使えないため、トークン取得と `AccessToken` 設定など別の接続方法が必要 |
 | **EF6（6.1 以降）** | ORM 利用時 | `CommitFailureHandler` がこの問題専用の公式機能（7-5 参照） |
 
@@ -237,6 +235,8 @@ WHERE CreatedAtUtc < DATEADD(DAY, -30, SYSUTCDATETIME());
 
 Commit 前の一時エラーは再試行するが、**Commit 例外後は成功確認だけを行い、行が見えなくても自動で業務処理を再実行しない**。未確認なら不確定として扱うため、真にロールバック済みの要求でも運用上の照合が必要になる場合がある。照合後の再送でも元のキーを維持する。
 
+**ブロッキングに注意:** 同じキーの要求が並行して走っている場合、後続のジャーナル INSERT は一意インデックスで**ロック待ち**になり、重複キー違反 (2627) は先行トランザクションが決着してから返る。Rollback / Dispose に失敗して孤立したトランザクションがサーバ側に残ると、再試行はコマンドタイムアウトまでブロックする。
+
 ```csharp
 // NuGet: Microsoft.Data.SqlClient 6.1 (LTS) の最新修正パッチを想定
 using System;
@@ -252,7 +252,7 @@ namespace Sample.DataAccess
         Committed,          // 正常にコミット完了
         AlreadyCommitted,   // 前回試行が実はコミット済みだった (ジャーナル行で判明)
         RetryableBeforeCommit,
-        InDoubt             // 成功を確認できず不確定 (運用アラート対象)
+        InDoubt             // 成功を確認できず不確定。TryOnce の内部結果で、Execute では InDoubtCommitException に変換される
     }
 
     /// <summary>コミット結果を確定できなかったことを表す例外 (手動確認が必要)</summary>
@@ -272,6 +272,7 @@ namespace Sample.DataAccess
         private readonly Action<string, IDictionary<string, object>> _logEvent;
 
         // Azure SQL の再構成時に返る代表的な一時エラー番号 (Microsoft Learn の一覧より)
+        // 40143 / 40540 は通常 40197 の内包コードとしてメッセージ側に現れる (Number は 40197) が、念のため保持する
         private static readonly HashSet<int> TransientSqlErrors = new HashSet<int>
         {
             4060, 40197, 40501, 40613, 40143, 40540, 49918, 49919, 49920,
@@ -419,6 +420,7 @@ namespace Sample.DataAccess
                 try
                 {
                     using (var conn = new SqlConnection(_connectionString) { RetryLogicProvider = OpenRetryProvider })
+                    // RCSI 有効時このヒントは行バージョン管理のまま。確定待ちが必要なら READCOMMITTEDLOCK を検討する
                     using (var cmd = new SqlCommand(
                         "SELECT COUNT(*) FROM dbo.TxnJournal WITH (READCOMMITTED) WHERE IdempotencyKey = @key;", conn))
                     {
