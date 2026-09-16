@@ -521,7 +521,7 @@ namespace Sample.DataAccess
 
 `RetryableBeforeCommit` は「この試行では Commit を呼んでいない一時エラー」であり、サーバー側ロールバックの完了を観測したという意味ではない。Rollback / Dispose は試みるが失敗し得るため、必ず新しい接続で、同じキーの INSERT を先頭に置いて再試行する。
 
-`VerifyCommit` は最大 6 回照会し、試行間のアプリ層待機は 5 + 10 + 20 + 40 + 60 = **135 秒**。最終試行後には待機しない。これに接続・照会・ドライバー内部の再試行時間が加わるため、**処理全体が 135 秒以内に終わる保証ではない**。この参考実装には総経過時間による打ち切りやキャンセルは含まれない。本番では Web 要求の時間予算と整合する上限を設け、超過時は不確定状態を維持してバックグラウンド確認へ移すなどの設計が必要。
+`VerifyCommit` は最大 6 回照会し、試行間のアプリ層待機は 5 + 10 + 20 + 40 + 60 = **135 秒**。最終試行後には待機しない。これに接続・照会・ドライバー内部の再試行時間が加わるため、**処理全体が 135 秒以内に終わる保証ではない**。そもそも `VerifyCommit` に入る前に、3-3 のとおり `Commit()` の応答待ちで最大 `Connect Timeout` 分を消費する。この参考実装には総経過時間による打ち切りやキャンセルは含まれない。本番では Web 要求の時間予算と整合する上限を設け、超過時は不確定状態を維持してバックグラウンド確認へ移すなどの設計が必要。
 
 #### 呼び出し例
 
@@ -549,11 +549,14 @@ var outcome = runner.Execute(key, "WorkPlan.UpdateStatus", (conn, tx) =>
 ```text
 Server=tcp:<server>.database.windows.net,1433;Database=<db>;
 Authentication=Active Directory Managed Identity;Encrypt=True;
-Connect Timeout=30;ConnectRetryCount=3;ConnectRetryInterval=10;MultiSubnetFailover=True
+Connect Timeout=30;ConnectRetryCount=2;ConnectRetryInterval=10
 ```
 
 - この例は App Service のシステム割り当て Managed Identity と SQL Database の書き込み先への接続を想定する。ID の有効化、DB ユーザーの作成と必要な権限付与、ネットワーク到達性は別途構成する。MI の場合はその接続先へ変更する。
 - `ConnectRetryCount` / `ConnectRetryInterval` は、**初回の `Open()` の接続回復性と、切断されたアイドル接続の回復性の両方**に関係する。実行途中のクエリやアクティブなトランザクションを自動で再実行するものではない（[公式資料](https://learn.microsoft.com/azure/azure-sql/database/troubleshoot-common-connectivity-issues?view=azuresql#net-sqlconnection-parameters-for-connection-retry)）。
+- **`Connect Timeout` は全再試行を賄える値にする**。公式の条件は `Connect Timeout >= ConnectRetryCount × ConnectRetryInterval` だが、同資料のタイムライン例では 0 回目の試行と障害検知の時間も加算される（検知 1 秒 + 10 秒 × 3 回 = 31 秒）。`ConnectRetryCount=3` だと 30 秒では 3 回目に到達しないため、上記例では 2 回に抑えている。
+- **`Connect Timeout` は Commit の待ち時間も決める**。3-3 のとおり `SqlTransaction.Commit()` は `CommandTimeout` ではなく `ConnectTimeout` を参照するため、上記例では Commit の応答待ちが最大 30 秒になる。値を大きくすると接続再試行の余裕は増えるが、不確定状態の判明がその分遅れる。
+- **`MultiSubnetFailover` は指定しない**。公式定義は「SQL Server 2012 以降の可用性グループ リスナーまたはフェールオーバー クラスター インスタンスに接続する場合は常に指定する」で、ゲートウェイ経由の Azure SQL Database / MI は対象外。指定すると `TransparentNetworkIPResolution` と `IPAddressPreference` が無視される（[接続文字列キーワードの仕様](https://learn.microsoft.com/dotnet/api/microsoft.data.sqlclient.sqlconnection.connectionstring)）。
 - 接続回復性に加えて、`OpenRetryProvider` は `NumberOfTries = 5`、つまり **初回を含む最大 5 試行**を行う。さらにアプリ層にも再試行があるため、回数と待機が積み重なる。`MaxTimeInterval` は個々の待機の上限であり、総経過時間を制限しない。接続タイムアウト・コマンドタイムアウトにも各試行の実行時間が必要で、設定した全再試行を必ず消化できるわけではない。
 - 本番では再試行を担当する層を整理する。例えば接続回復性を `ConnectRetryCount=0` で無効にする、`OpenRetryProvider` を外してアプリ層に集約する、または併用時の総時間予算を設定する。クライアント側の -2 は CRL の既定の一時エラー一覧には含まれず、本例ではアプリ層の一覧で扱う。
 - ドライバのコマンド再試行は「組み込みのコマンド プロバイダーは、トランザクションがアクティブな場合には再試行を行わないため、複数ステートメントのトランザクションは、トランザクションを再作成できるアプリケーション コードで再試行する必要がある」とされている。このため、トランザクションの再試行は本コードのようにアプリ層で行う。
@@ -569,13 +572,16 @@ using Microsoft.ApplicationInsights;
 using Microsoft.ApplicationInsights.Extensibility;
 using Sample.DataAccess;
 
-var telemetry = new TelemetryClient(TelemetryConfiguration.Active);
+var configuration = TelemetryConfiguration.CreateDefault();
+configuration.ConnectionString = appInsightsConnectionString;
+
+var telemetry = new TelemetryClient(configuration);
 var runner = new ResilientTransactionRunner(connectionString, (name, props) =>
     telemetry.TrackEvent(name, props.ToDictionary(property => property.Key,
         property => Convert.ToString(property.Value, CultureInfo.InvariantCulture))));
 ```
 
-`using` はファイル先頭、`var telemetry` 以降はアプリケーションの初期化メソッド内に置く。Application Insights の接続文字列などを構成済みの `TelemetryConfiguration` を使い、`TelemetryClient` を再利用する。通常のログ出力例外はトランザクション制御から隔離し、独立した Trace 出力へフォールバックする。ただし Trace の出力先設定も必要であり、**両方の出力先の障害や AP プロセス停止時の記録まで保証するものではない**。未解決イベントをサンプリング対象から除外し、ログ収集経路自体も監視する。
+`using` はファイル先頭、`var configuration` 以降はアプリケーションの初期化メソッド内に置く。`TelemetryConfiguration.Active` は非推奨のため使わず、DI などで管理された `TelemetryConfiguration` があればそれを使う。`TelemetryConfiguration` と `TelemetryClient` はアプリケーション全体で再利用し、要求ごとに生成しない。通常のログ出力例外はトランザクション制御から隔離し、独立した Trace 出力へフォールバックする。ただし Trace の出力先設定も必要であり、**両方の出力先の障害や AP プロセス停止時の記録まで保証するものではない**。未解決イベントをサンプリング対象から除外し、ログ収集経路自体も監視する。
 
 イベント名の意味付け:
 
@@ -725,6 +731,7 @@ new SqlAzureExecutionStrategy().Execute(() =>
 
 - [SQL Server 用 Microsoft.Data.SqlClient（概要・本番向けベースライン）](https://learn.microsoft.com/sql/connect/ado-net/microsoft-ado-net-sql-server?view=sql-server-ver17)
 - [SqlClient ドライバーのサポート ライフサイクル](https://learn.microsoft.com/sql/connect/ado-net/sqlclient-driver-support-lifecycle?view=sql-server-ver17)
+- [SqlConnection.ConnectionString（接続文字列キーワードの仕様・MultiSubnetFailover の適用範囲）](https://learn.microsoft.com/dotnet/api/microsoft.data.sqlclient.sqlconnection.connectionstring)
 - [SqlClient の構成可能な再試行ロジック](https://learn.microsoft.com/sql/connect/ado-net/configurable-retry-logic?view=sql-server-ver17)
 - [SqlClient で再試行ロジックを設定](https://learn.microsoft.com/sql/connect/ado-net/configurable-retry-logic-sqlclient-introduction?view=sql-server-ver17)
 - [SqlClient の Microsoft Entra 認証と 7.0 への移行](https://learn.microsoft.com/sql/connect/ado-net/sql/azure-active-directory-authentication?view=sql-server-ver17)
